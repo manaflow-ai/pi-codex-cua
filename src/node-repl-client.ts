@@ -33,8 +33,20 @@ type Pending = {
   reject(error: Error): void;
 };
 
+export const DEFAULT_TOOL_TIMEOUT_MS = 30_000;
+export const DEFAULT_INITIALIZE_TIMEOUT_MS = 15_000;
+
+export type NodeReplClientOptions = {
+  toolTimeoutMs?: number;
+  initializeTimeoutMs?: number;
+};
+
+class RequestInterruptedError extends Error {}
+
 export class NodeReplClient {
   private readonly runtime: CodexCuaRuntime;
+  private readonly toolTimeoutMs: number;
+  private readonly initializeTimeoutMs: number;
   private child?: ChildProcessWithoutNullStreams;
   private lines?: Interface;
   private nextId = 1;
@@ -42,8 +54,10 @@ export class NodeReplClient {
   private starting?: Promise<void>;
   private stderr = "";
 
-  constructor(runtime: CodexCuaRuntime) {
+  constructor(runtime: CodexCuaRuntime, options: NodeReplClientOptions = {}) {
     this.runtime = runtime;
+    this.toolTimeoutMs = options.toolTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
+    this.initializeTimeoutMs = options.initializeTimeoutMs ?? DEFAULT_INITIALIZE_TIMEOUT_MS;
   }
 
   async callSky(
@@ -52,16 +66,23 @@ export class NodeReplClient {
     turn: TurnIdentity,
     signal?: AbortSignal,
   ): Promise<McpCallResult> {
-    await this.start();
-    return this.request(
-      "tools/call",
-      {
-        name: method,
-        arguments: prepareMcpArguments(method, args),
-        _meta: buildRequestMeta(turn),
-      },
-      signal,
-    );
+    try {
+      await this.start();
+      return await this.request(
+        "tools/call",
+        {
+          name: method,
+          arguments: prepareMcpArguments(method, args),
+          _meta: buildRequestMeta(turn),
+        },
+        signal,
+        this.toolTimeoutMs,
+        method,
+      );
+    } catch (error) {
+      if (error instanceof RequestInterruptedError) this.terminateChild();
+      throw error;
+    }
   }
 
   async start(): Promise<void> {
@@ -100,6 +121,7 @@ export class NodeReplClient {
     this.lines = createInterface({ input: child.stdout });
     this.lines.on("line", (line) => this.onLine(line));
     child.once("exit", (code, signal) => {
+      if (this.child !== child) return;
       const detail = this.stderr.trim();
       const error = new Error(
         `Codex Computer Use exited (${signal ?? code ?? "unknown"})${detail ? `: ${detail}` : ""}`,
@@ -111,12 +133,17 @@ export class NodeReplClient {
       this.lines = undefined;
     });
 
-    await this.request("initialize", {
-      protocolVersion: "2025-06-18",
-      capabilities: {},
-      clientInfo: { name: "pi-codex-cua", version: "0.1.0" },
-    });
-    this.notify("notifications/initialized", {});
+    try {
+      await this.request("initialize", {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "pi-codex-cua", version: "0.1.0" },
+      }, undefined, this.initializeTimeoutMs, "initialization");
+      this.notify("notifications/initialized", {});
+    } catch (error) {
+      this.terminateChild();
+      throw error;
+    }
   }
 
   private onLine(line: string) {
@@ -151,29 +178,53 @@ export class NodeReplClient {
     method: string,
     params: Record<string, unknown>,
     signal?: AbortSignal,
+    timeoutMs = this.toolTimeoutMs,
+    operation = method,
   ): Promise<McpCallResult> {
     if (!this.child || this.child.exitCode !== null) {
       return Promise.reject(new Error("Codex node_repl is not running"));
     }
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
+      let timeout: NodeJS.Timeout | undefined;
+      const cleanup = () => {
+        if (timeout) clearTimeout(timeout);
+        signal?.removeEventListener("abort", onAbort);
+      };
       const onAbort = () => {
         this.pending.delete(id);
         this.notify("notifications/cancelled", { requestId: id, reason: "Pi tool call cancelled" });
-        reject(signal?.reason instanceof Error ? signal.reason : new Error("Cancelled"));
+        cleanup();
+        reject(new RequestInterruptedError(
+          signal?.reason instanceof Error ? signal.reason.message : "Cancelled",
+        ));
       };
       this.pending.set(id, {
         resolve: (value) => {
-          signal?.removeEventListener("abort", onAbort);
+          cleanup();
           resolve(value);
         },
         reject: (error) => {
-          signal?.removeEventListener("abort", onAbort);
+          cleanup();
           reject(error);
         },
       });
       signal?.addEventListener("abort", onAbort, { once: true });
       if (signal?.aborted) return onAbort();
+      timeout = setTimeout(() => {
+        this.pending.delete(id);
+        this.notify("notifications/cancelled", {
+          requestId: id,
+          reason: `${operation} timed out`,
+        });
+        cleanup();
+        reject(new RequestInterruptedError(
+          `Codex Computer Use ${operation} timed out after ${formatDuration(timeoutMs)}. ` +
+          "The bridge was restarted so later tool calls can continue. " +
+          "The app may be waiting for an approval or security advisory.",
+        ));
+      }, timeoutMs);
+      timeout.unref();
       this.write({ jsonrpc: "2.0", id, method, params });
     });
   }
@@ -187,10 +238,21 @@ export class NodeReplClient {
   }
 
   close() {
+    this.terminateChild();
+  }
+
+  private terminateChild() {
     this.lines?.close();
     this.child?.kill("SIGTERM");
     this.child = undefined;
+    this.lines = undefined;
   }
+}
+
+function formatDuration(milliseconds: number): string {
+  return milliseconds % 1_000 === 0
+    ? `${milliseconds / 1_000}s`
+    : `${milliseconds}ms`;
 }
 
 export function buildRequestMeta(turn: TurnIdentity) {

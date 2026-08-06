@@ -53,6 +53,12 @@ Most users need none. Development and nonstandard installations can set:
 - `PI_CODEX_CUA_CODEX`
 - `PI_CODEX_CUA_SERVICE`
 - `PI_CODEX_CUA_SOCKET_DIRECTORY`
+- `PI_CODEX_CUA_TOOL_TIMEOUT_MS` (defaults to 30000)
+- `PI_CODEX_CUA_INITIALIZE_TIMEOUT_MS` (defaults to 15000)
+
+Every Computer Use tool has a watchdog. If Sky hangs on an app approval,
+security advisory, or accessibility request, the call fails with a timeout and
+the MCP bridge restarts so the next tool call is not blocked behind it.
 
 ## Protocol parity
 

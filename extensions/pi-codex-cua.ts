@@ -143,7 +143,10 @@ export default function piCodexCua(pi: ExtensionAPI) {
   let sessionId = randomSessionId();
 
   try {
-    client = new NodeReplClient(resolveCodexCuaRuntime());
+    client = new NodeReplClient(resolveCodexCuaRuntime(), {
+      toolTimeoutMs: timeoutFromEnv("PI_CODEX_CUA_TOOL_TIMEOUT_MS"),
+      initializeTimeoutMs: timeoutFromEnv("PI_CODEX_CUA_INITIALIZE_TIMEOUT_MS"),
+    });
   } catch (error) {
     runtimeError = error instanceof Error ? error : new Error(String(error));
   }
@@ -238,4 +241,14 @@ function resultText(result: McpCallResult): string {
 
 function randomSessionId(): string {
   return `pi-cua-${Date.now().toString(36)}`;
+}
+
+function timeoutFromEnv(name: string): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined) return undefined;
+  const milliseconds = Number(raw);
+  if (!Number.isFinite(milliseconds) || milliseconds <= 0) {
+    throw new Error(`${name} must be a positive number of milliseconds`);
+  }
+  return milliseconds;
 }
